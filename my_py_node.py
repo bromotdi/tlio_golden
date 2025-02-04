@@ -1,4 +1,4 @@
-import os
+mport os
 import rclpy
 from rclpy.node import Node
 from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
@@ -119,28 +119,15 @@ def convert_csv_to_odometry(input_csv, output_csv):
     # Write the odometry DataFrame to a CSV file
     odometry_df.to_csv(output_csv, index=False)
 
+
 class BagToImuAndGps(Node):
-    """
-    Full pipeline node that extracts IMU, GPS, and Quaternion from a .mcap (or .db3)
-    and writes them to separate CSVs.
-    """
     def __init__(self, bag_path, imu_csv_file, gps_csv_file, quat_csv_file):
         super().__init__('bag_to_imu_and_gps')
         self.bag_path = bag_path
 
-        # Detect extension: for .db3 or .mcap, you can set storage_id accordingly
-        # For mcap:  storage_id = 'mcap'
-        # For db3:   storage_id = 'sqlite3'
-        # Below is a simple guess based on file extension:
-        extension = os.path.splitext(self.bag_path)[1].lower()
-        if extension == '.db3':
-            storage_id = 'sqlite3'
-        else:
-            storage_id = 'mcap'
-
-        # Set up the reader
+        # Set up the reader to use MCAP
         self.reader = SequentialReader()
-        storage_options = StorageOptions(uri=self.bag_path, storage_id=storage_id)
+        storage_options = StorageOptions(uri=self.bag_path, storage_id='mcap')
         converter_options = ConverterOptions('', '')
         self.reader.open(storage_options, converter_options)
 
@@ -183,33 +170,39 @@ class BagToImuAndGps(Node):
         )
 
     def convert(self):
-        """Iterate over messages, saving IMU (/ubuntu/cube_imu/data) + fallback and GPS (/ubuntu/gps) + Quat data."""
+        """Iterate over all messages, saving IMU (/ubuntu/cube_imu/data) and GPS (/ubuntu/gps) data."""
+
+        # 1) Figure out which IMU topic to read by inspecting the bag’s metadata
         topics_and_types = self.reader.get_all_topics_and_types()
         topic_names = [t.name for t in topics_and_types]
 
         # Decide which IMU topic to use
         if '/ubuntu/cube_imu/data' in topic_names:
-            imu_topic = '/ubuntu/cube_imu/data'       # primary
+            imu_topic = '/ubuntu/cube_imu/data'     # primary
         elif '/ubuntu/icm20948_imu/data_raw' in topic_names:
             imu_topic = '/ubuntu/icm20948_imu/data_raw'  # fallback
         else:
+            # If neither is present, we won't parse IMU at all.
             imu_topic = None
+
 
         while self.reader.has_next():
             topic, data, t = self.reader.read_next()
-
-            # Handle IMU if this is our chosen IMU topic
+            
+               # Handle IMU if this is our chosen IMU topic
             if imu_topic and topic == imu_topic:
                 msg_type = get_message('sensor_msgs/msg/Imu')
                 msg = deserialize_message(data, msg_type)
                 self.save_imu(msg)
-
+        
             elif topic == '/ubuntu/gps':
+                # Deserialize as sensor_msgs/msg/NavSatFix
                 msg_type = get_message('sensor_msgs/msg/NavSatFix')
                 msg = deserialize_message(data, msg_type)
                 self.save_gps(msg)
-
+            
             elif topic == '/ubuntu/gps/quaternion':
+                # Deserialize as geometry_msgs/msg/Quaternion
                 msg_type = get_message('geometry_msgs/msg/Quaternion')
                 msg = deserialize_message(data, msg_type)
                 self.save_quaternion(msg, t)
@@ -220,6 +213,7 @@ class BagToImuAndGps(Node):
         stamp_sec = hdr.stamp.sec
         stamp_nsec = hdr.stamp.nanosec
 
+        # Create one CSV line (without covariance)
         line = (
             f"{stamp_sec}.{stamp_nsec},"
             f"{msg.angular_velocity.x},{msg.angular_velocity.y},{msg.angular_velocity.z},"
@@ -240,9 +234,7 @@ class BagToImuAndGps(Node):
         self.gps_file.write(line)
 
     def save_quaternion(self, msg, bag_time):
-        """
-        Write Quaternion. We treat bag_time (nanoseconds) as a float here.
-        """
+        # Convert bag_time_ns (nanoseconds) to seconds if you like:
         line = (
             f"{bag_time},"
             f"{msg.x},{msg.y},{msg.z},{msg.w}\n"
@@ -250,7 +242,7 @@ class BagToImuAndGps(Node):
         self.quat_file.write(line)
 
     def __del__(self):
-        # Close files
+        # Close the files if they were opened
         if hasattr(self, 'imu_file') and self.imu_file:
             self.imu_file.close()
         if hasattr(self, 'gps_file') and self.gps_file:
@@ -259,93 +251,22 @@ class BagToImuAndGps(Node):
             self.quat_file.close()
 
 
-class BagToImuOnly(Node):
-    """
-    A minimal pipeline that extracts ONLY the IMU data into a CSV and ignores everything else.
-    Used if the folder name starts with 'NOT_'.
-    """
-    def __init__(self, bag_path, imu_csv_file):
-        super().__init__('bag_to_imu_only')
-        self.bag_path = bag_path
-
-        # Detect extension
-        extension = os.path.splitext(self.bag_path)[1].lower()
-        if extension == '.db3':
-            storage_id = 'sqlite3'
-        else:
-            storage_id = 'mcap'
-
-        self.reader = SequentialReader()
-        storage_options = StorageOptions(uri=self.bag_path, storage_id=storage_id)
-        converter_options = ConverterOptions('', '')
-        self.reader.open(storage_options, converter_options)
-
-        # Prepare IMU CSV
-        self.imu_csv_file = imu_csv_file
-        imu_dir = os.path.dirname(self.imu_csv_file)
-        if imu_dir and not os.path.exists(imu_dir):
-            os.makedirs(imu_dir)
-        self.imu_file = open(self.imu_csv_file, 'w')
-
-        self.imu_file.write(
-            "header_stamp,"
-            "angular_velocity_x,angular_velocity_y,angular_velocity_z,"
-            "linear_acceleration_x,linear_acceleration_y,linear_acceleration_z\n"
-        )
-
-    def convert(self):
-        """Read messages and save IMU data ONLY."""
-        topics_and_types = self.reader.get_all_topics_and_types()
-        topic_names = [t.name for t in topics_and_types]
-
-        # Decide which IMU topic to use (same logic as before)
-        if '/imx8/icm20948_imu/data_raw' in topic_names:
-            imu_topic = '/imx8/icm20948_imu/data_raw'
-        elif '/ubuntu/icm20948_imu/data_raw' in topic_names:
-            imu_topic = '/ubuntu/icm20948_imu/data_raw'
-        else:
-            imu_topic = None
-
-        while self.reader.has_next():
-            topic, data, t = self.reader.read_next()
-            if imu_topic and topic == imu_topic:
-                msg_type = get_message('sensor_msgs/msg/Imu')
-                msg = deserialize_message(data, msg_type)
-                self.save_imu(msg)
-
-    def save_imu(self, msg):
-        hdr = msg.header
-        stamp_sec = hdr.stamp.sec
-        stamp_nsec = hdr.stamp.nanosec
-
-        line = (
-            f"{stamp_sec}.{stamp_nsec},"
-            f"{msg.angular_velocity.x},{msg.angular_velocity.y},{msg.angular_velocity.z},"
-            f"{msg.linear_acceleration.x},{msg.linear_acceleration.y},{msg.linear_acceleration.z}\n"
-        )
-        self.imu_file.write(line)
-
-    def __del__(self):
-        if hasattr(self, 'imu_file') and self.imu_file:
-            self.imu_file.close()
-
-
 def merge_lat_and_quat(gps_csv_file, quat_csv_file, lat_data_with_quat):
-    df_lat = pd.read_csv(gps_csv_file)
+    df_lat  = pd.read_csv(gps_csv_file)
     df_quat = pd.read_csv(quat_csv_file)
 
-    # Truncate both DataFrames to the same length if they differ
+    # Усечём оба DataFrame до одинаковой длины, если они не совпадают
     min_len = min(len(df_lat), len(df_quat))
-    df_lat = df_lat.iloc[:min_len].reset_index(drop=True)
+    df_lat  = df_lat.iloc[:min_len].reset_index(drop=True)
     df_quat = df_quat.iloc[:min_len].reset_index(drop=True)
 
-    # Add columns from df_quat
+    # Добавляем колонки из df_quat
     df_lat["quaternion_x"] = df_quat["quaternion_x"]
     df_lat["quaternion_y"] = df_quat["quaternion_y"]
     df_lat["quaternion_z"] = df_quat["quaternion_z"]
     df_lat["quaternion_w"] = df_quat["quaternion_w"]
 
-    # Save the result
+    # Сохраняем результат
     df_lat.to_csv(lat_data_with_quat, index=False)
 
 
@@ -354,31 +275,28 @@ def merge_gps_and_imu(
     imu_data_csv: str,
     merged_output_csv: str
 ):
+
     df_gps = pd.read_csv(gps_data_csv)
     df_imu = pd.read_csv(imu_data_csv)
 
-    # Rename 'header_stamp' to 'timestamp' in the IMU for consistent merging
+    # Rename 'header_stamp' to 'timestamp' in the IMU data for consistent merging
     imu_data_renamed = df_imu.rename(columns={'header_stamp': 'timestamp'})
 
-    # Merge on 'timestamp' using the nearest approach
-    merged_data = pd.merge_asof(
-        df_gps.sort_values('timestamp'),
-        imu_data_renamed.sort_values('timestamp'),
-        on='timestamp',
-        direction='nearest'
-    )
+    # Merging the dataframes on the 'timestamp' column using the closest timestamp
+    merged_data = pd.merge_asof(df_gps.sort_values('timestamp'), imu_data_renamed.sort_values('timestamp'), on='timestamp', direction='nearest')
 
     merged_data.to_csv(merged_output_csv, index=False)
 
 
-def process_single_bag_full(bag_path: str, output_folder: str):
+def process_single_bag(bag_path: str, output_folder: str):
     """
-    Full pipeline for a single bag:
-      1. Extract IMU, GPS, Quaternion
-      2. Merge lat-lon-alt with Quaternion
-      3. Convert lat-lon-alt to local NED
-      4. Merge result with IMU data
+    Processes a single .mcap bag file:
+      1. Reads data into IMU, GPS, and quaternion CSVs
+      2. Merges GPS & quaternion data
+      3. Converts lat-lon-alt to NED
+      4. Merges resulting GPS data with IMU data
     """
+    # Make sure output folder exists
     os.makedirs(output_folder, exist_ok=True)
 
     # Define all CSV output inside this folder
@@ -389,94 +307,68 @@ def process_single_bag_full(bag_path: str, output_folder: str):
     final_gps_odometry  = os.path.join(output_folder, "gps_data.csv")
     merged_gps_imu_file = os.path.join(output_folder, "gps_imu_merged.csv")
 
-    # 1) Extract from bag
+    # 1) Initialize and read from bag
     rclpy.init()
     node = BagToImuAndGps(bag_path, imu_csv_file, gps_csv_file, quat_csv_file)
     node.convert()
     node.destroy_node()
     rclpy.shutdown()
 
-    # 2) Merge lat & quat
+    # 2) Merge lat_data.csv & quat_data.csv → lat_data_with_quat.csv
     merge_lat_and_quat(gps_csv_file, quat_csv_file, lat_data_with_quat)
 
-    # 3) Convert lat_data_with_quat → NED
+    # 3) Convert lat_data_with_quat → NED (gps_data.csv)
     convert_csv_to_odometry(lat_data_with_quat, final_gps_odometry)
 
-    # 4) Merge with IMU
+    # 4) Merge gps_data.csv & imu_data.csv → gps_imu_merged.csv
     merge_gps_and_imu(final_gps_odometry, imu_csv_file, merged_gps_imu_file)
     
-    print(f"Done processing (FULL) bag: {bag_path}")
-    print("Created files:")
-    print(f"  {imu_csv_file}")
-    print(f"  {gps_csv_file}")
-    print(f"  {quat_csv_file}")
-    print(f"  {lat_data_with_quat}")
-    print(f"  {final_gps_odometry}")
-    print(f"  {merged_gps_imu_file}")
+    print(f"Done processing bag: {bag_path}")
+    print(f"Created files:\n  {imu_csv_file}\n  {gps_csv_file}\n  {quat_csv_file}\n  {lat_data_with_quat}\n  {final_gps_odometry}\n  {merged_gps_imu_file}")
 
 
-def process_single_bag_minimal(bag_path: str, output_folder: str):
+
+def process_all_bags_in_folder(input_folder: str, output_root: str):
     """
-    Minimal pipeline if folder starts with 'NOT_':
-      - Only extract IMU data into imu_data.csv
-      - Ignore GPS and Quat
+    For each .mcap bag file found in input_folder, create an output subfolder
+    and run the pipeline.
+    
+    :param input_folder: Directory containing .mcap files
+    :param output_root:  Where to place the converted_data/ subfolders
     """
-    os.makedirs(output_folder, exist_ok=True)
-    imu_csv_file = os.path.join(output_folder, "imu_data.csv")
+    # Make sure the folder for all outputs exists
+    os.makedirs(output_root, exist_ok=True)
 
-    rclpy.init()
-    node = BagToImuOnly(bag_path, imu_csv_file)
-    node.convert()
-    node.destroy_node()
-    rclpy.shutdown()
-
-    print(f"Done processing (MINIMAL) bag: {bag_path}")
-    print(f"Created file: {imu_csv_file}")
-
-
-def process_all_bags_in_folder(input_folder: str, output_folder: str, full_pipeline: bool):
-    """
-    - Finds both .mcap and .db3 files in `input_folder`
-    - If `full_pipeline` is True, run the full pipeline
-    - Otherwise (False), only extract IMU data
-    """
-    os.makedirs(output_folder, exist_ok=True)
-
-    # Find all .mcap & .db3 bag files in 'input_folder'
-    bag_files_mcap = sorted(glob.glob(os.path.join(input_folder, '*.mcap')))
-    bag_files_db3  = sorted(glob.glob(os.path.join(input_folder, '*.db3')))
-    bag_files = bag_files_mcap + bag_files_db3
-
+    # Find all .mcap bag files in 'input_folder'
+    bag_files = sorted(glob.glob(os.path.join(input_folder, '*.mcap')))
     if not bag_files:
-        print(f"No .mcap or .db3 files found in {input_folder}")
+        print(f"No .mcap files found in {input_folder}")
         return
     
-    print(f"Found {len(bag_files)} file(s) in {input_folder}")
+    print(f"Found {len(bag_files)} .mcap files in {input_folder}")
 
     for bag_path in bag_files:
-        # Example naming: if bag_path = "/home/ubuntu/dataset/run1.bag.mcap",
+        # Example naming: 
+        #   if bag_path = "/home/ubuntu/dataset/run1.bag.mcap",
         #   bag_name = "run1.bag"
         bag_name = os.path.splitext(os.path.basename(bag_path))[0]
         
-        # Create subfolder for each bag
-        output_subfolder = os.path.join(output_folder, f"{bag_name}_converted_data")
-        os.makedirs(output_subfolder, exist_ok=True)
+        # Create a subfolder inside output_root specifically for this bag
+        # e.g. "output_root/run1.bag_converted_data/"
+        output_folder = os.path.join(output_root, f"{bag_name}_converted_data")
+        os.makedirs(output_folder, exist_ok=True)
 
-        if full_pipeline:
-            process_single_bag_full(bag_path, output_subfolder)
-        else:
-            process_single_bag_minimal(bag_path, output_subfolder)
+        # Now process the single bag
+        process_single_bag(bag_path, output_folder)
+
 
 
 def main():
     """
     Example main function that processes multiple input folders,
-    each possibly containing .mcap or .db3 files.
-    
-    - If folder name starts with "NOT_", use the minimal pipeline (only IMU).
-    - Otherwise, use the full pipeline.
+    each containing multiple .mcap files.
     """
-    # List of folders to process
+    # List of folders that contain .mcap files
     input_folders = [
         "/home/ubuntu/rnin-vio/tali_dataset/1",
         "/home/ubuntu/rnin-vio/tali_dataset/2",
@@ -488,82 +380,22 @@ def main():
         "/home/ubuntu/rnin-vio/tali_dataset/7",
         "/home/ubuntu/rnin-vio/tali_dataset/8",
         "/home/ubuntu/rnin-vio/tali_dataset/gps7_dji_ar0234_two_triangles_360",
-        "/home/ubuntu/rnin-vio/tali_dataset/gps8_dji_jetson_two_wierd_squares_17_12_180",
-        "/home/ubuntu/rnin-vio/tali_dataset/NOT_5_10_15_with_plus_for_slam_lock",
-        "/home/ubuntu/rnin-vio/tali_dataset/NOT_Cam15_2024-12-11-10-08-58-691748000",
-        "/home/ubuntu/rnin-vio/tali_dataset/NOT_dji_ar0234_2024-12-17-11-30-04-179116672",
-        "/home/ubuntu/rnin-vio/tali_dataset/NOT_dji_imx_flight3_11_12",
-        "/home/ubuntu/rnin-vio/tali_dataset/NOT_dji_imx_square_parking_lot_12_12",
-        "/home/ubuntu/rnin-vio/tali_dataset/NOT_square_no_turns_yaw_turn_circle",
-        "/home/ubuntu/rnin-vio/tali_dataset/NOT_square_with_turns_yaw_turn_slalum"
+        "/home/ubuntu/rnin-vio/tali_dataset/gps8_dji_jetson_two_wierd_squares_17_12_180"
     ]
-
     
-    # Where to place all outputs
+    # Where to store the final outputs, maybe a common root.
+    # Inside this, we will create subfolders for each input folder,
+    # then sub-subfolders for each bag.
     output_root = "/home/ubuntu/rnin-vio/ALL_CONVERTED"
     
     for folder in input_folders:
+        # e.g. /home/ubuntu/rnin-vio/tali_dataset/1 -> folder_name = "1"
         folder_name = os.path.basename(folder)
+        folder_output = os.path.join(output_root, folder_name)
 
-        # Decide pipeline based on folder prefix
-        if folder_name.startswith("NOT_"):
-            print(f"\n=== Processing folder (MINIMAL): {folder} ===")
-            process_all_bags_in_folder(folder, os.path.join(output_root, folder_name), full_pipeline=False)
-            print(f"=== Done folder: {folder} ===")
-        else:
-            print(f"\n=== Processing folder (FULL): {folder} ===")
-            process_all_bags_in_folder(folder, os.path.join(output_root, folder_name), full_pipeline=True)
-            print(f"=== Done folder: {folder} ===")
-
+        print(f"\n=== Processing folder: {folder} ===")
+        process_all_bags_in_folder(folder, folder_output)
+        print(f"=== Done folder: {folder} ===")
 
 if __name__ == '__main__':
     main()
-
-
-
-# import os
-# import rclpy
-# from rclpy.node import Node
-# from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
-# from rosidl_runtime_py.utilities import get_message
-# from rclpy.serialization import deserialize_message
-
-# class BagToPosition(Node):
-#     def __init__(self, bag_path, output_file):
-#         super().__init__('bag_to_position')
-#         self.bag_path = bag_path
-#         self.output_file = output_file
-#         self.reader = SequentialReader()
-#         storage_options = StorageOptions(uri=self.bag_path, storage_id='sqlite3')
-#         converter_options = ConverterOptions('', '')
-#         self.reader.open(storage_options, converter_options)
-
-#         if not os.path.exists(os.path.dirname(self.output_file)):
-#             os.makedirs(os.path.dirname(self.output_file))
-#         self.file = open(self.output_file, 'w')
-
-#     def convert(self):
-#         while self.reader.has_next():
-#             (topic, data, timestamp) = self.reader.read_next()
-#             if topic == 'leica/position':  # Убедитесь, что название топика верно
-#                 msg_type = get_message('geometry_msgs/msg/PointStamped')  # Предположим, что это PointStamped
-#                 msg = deserialize_message(data, msg_type)
-#                 self.save_position(msg, timestamp)
-
-#     def save_position(self, msg, timestamp):
-#         self.file.write(f'{timestamp}, {msg.point.x}, {msg.point.y}, {msg.point.z}\n')
-
-#     def __del__(self):
-#         self.file.close()
-
-# def main(args=None):
-#     rclpy.init(args=args)
-#     bag_path = '/home/ubuntu/Downloads/MH_03_medium.bag'
-#     output_file = '/home/ubuntu/xfeat_orb_gftt_comparison/src/my_py_pkg/my_py_pkg/position.csv'
-#     node = BagToPosition(bag_path, output_file)
-#     node.convert()
-#     node.destroy_node()
-#     rclpy.shutdown()
-
-# if __name__ == '__main__':
-#     main()
